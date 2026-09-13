@@ -1,7 +1,23 @@
 //! `cfgspawnabletypes.xml` round-trip parser (PDR §5.3, §9.3).
+//!
+//! Each `<type>` can carry any number of `<attachments>` and `<cargo>`
+//! groups, in any order — vanilla and modded files routinely interleave
+//! them (`<cargo>…<attachments>…<cargo>…`) rather than grouping all of
+//! one kind together.
+//!
+//! The reader is **hand-rolled over quick-xml events** rather than
+//! using the serde adapter, because quick-xml's serde deserializer
+//! rejects interleaved repeated elements with "duplicate field" — this
+//! blew up parsing for real-world files (e.g. Chernarus's own
+//! `cfgspawnabletypes.xml` and mod files like SNAFU's), skipping them
+//! entirely and dropping their loadouts. Same root cause already fixed
+//! in `cfg_randompresets_xml.rs`; the event walker is O(n) and handles
+//! any ordering.
 
 use std::path::Path;
 
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
@@ -9,7 +25,12 @@ use crate::domain::{
 };
 use crate::error::{AppError, AppResult};
 
-// ---------- XML schema ----------
+// ---------- Serialize-side schema ----------
+//
+// We still use serde for WRITING — we control the output ordering
+// (all attachments groups, then all cargo groups, per type) so serde's
+// repeated-element quirk doesn't bite on the output. The reader below
+// doesn't use this.
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename = "spawnabletypes")]
@@ -76,44 +97,203 @@ pub fn parse_bytes(
     source: ItemSource,
     file: &str,
 ) -> Result<Vec<SpawnableType>, String> {
-    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-    let parsed: File = quick_xml::de::from_str(text).map_err(|e| e.to_string())?;
-    Ok(parsed
-        .types
-        .into_iter()
-        .map(|t| SpawnableType {
-            name: t.name,
-            hoarder: t.hoarder.unwrap_or(0) == 1,
-            attachments: t
-                .attachments
-                .into_iter()
-                .map(|g| AttachmentGroup {
-                    chance: g.chance.unwrap_or(1.0),
-                    slot_name: g.slot_name,
-                    items: g.items.into_iter().map(item_from).collect(),
-                })
-                .collect(),
-            cargo: t
-                .cargo
-                .into_iter()
-                .map(|g| CargoGroup {
-                    chance: g.chance.unwrap_or(1.0),
-                    items: g.items.into_iter().map(item_from).collect(),
-                })
-                .collect(),
-            source,
-            mod_id: None,
-            file: file.to_string(),
-        })
-        .collect())
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out: Vec<SpawnableType> = Vec::new();
+
+    // The `<type>` currently being built, if we're inside one.
+    let mut current_type: Option<SpawnableType> = None;
+
+    // The `<attachments>`/`<cargo>` group currently being built, if
+    // we're inside one (groups don't nest, so one level suffices).
+    let mut current_group_is_cargo: Option<bool> = None;
+    let mut current_group_chance = 1.0f64;
+    let mut current_group_slot: Option<String> = None;
+    let mut current_items: Vec<SpawnableItem> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = element_name_lower(&e)?;
+                match name.as_str() {
+                    "spawnabletypes" => {} // root, ignore
+                    "type" => {
+                        let (t_name, hoarder) = read_type_attrs(&e)?;
+                        current_type = Some(SpawnableType {
+                            name: t_name,
+                            hoarder,
+                            attachments: Vec::new(),
+                            cargo: Vec::new(),
+                            source,
+                            mod_id: None,
+                            file: file.to_string(),
+                        });
+                    }
+                    "attachments" | "cargo" => {
+                        if current_type.is_some() {
+                            let (chance, slot_name) = read_group_attrs(&e)?;
+                            current_group_is_cargo = Some(name == "cargo");
+                            current_group_chance = chance;
+                            current_group_slot = slot_name;
+                            current_items.clear();
+                        }
+                    }
+                    "item" => {
+                        if current_group_is_cargo.is_some() {
+                            current_items.push(read_item(&e)?);
+                        }
+                    }
+                    _ => {} // unknown element — skip
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let name = element_name_lower(&e)?;
+                match name.as_str() {
+                    "type" => {
+                        // Empty type, e.g. `<type name="X"/>`.
+                        let (t_name, hoarder) = read_type_attrs(&e)?;
+                        out.push(SpawnableType {
+                            name: t_name,
+                            hoarder,
+                            attachments: Vec::new(),
+                            cargo: Vec::new(),
+                            source,
+                            mod_id: None,
+                            file: file.to_string(),
+                        });
+                    }
+                    "attachments" | "cargo" => {
+                        if let Some(t) = current_type.as_mut() {
+                            let (chance, slot_name) = read_group_attrs(&e)?;
+                            if name == "cargo" {
+                                t.cargo.push(CargoGroup {
+                                    chance,
+                                    items: Vec::new(),
+                                });
+                            } else {
+                                t.attachments.push(AttachmentGroup {
+                                    chance,
+                                    slot_name,
+                                    items: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    "item" => {
+                        if current_group_is_cargo.is_some() {
+                            current_items.push(read_item(&e)?);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = element_name_lower_end(&e)?;
+                match name.as_str() {
+                    "attachments" | "cargo" => {
+                        if let (Some(is_cargo), Some(t)) =
+                            (current_group_is_cargo.take(), current_type.as_mut())
+                        {
+                            let items = std::mem::take(&mut current_items);
+                            if is_cargo {
+                                t.cargo.push(CargoGroup {
+                                    chance: current_group_chance,
+                                    items,
+                                });
+                            } else {
+                                t.attachments.push(AttachmentGroup {
+                                    chance: current_group_chance,
+                                    slot_name: current_group_slot.take(),
+                                    items,
+                                });
+                            }
+                        }
+                        current_group_chance = 1.0;
+                        current_group_slot = None;
+                    }
+                    "type" => {
+                        if let Some(t) = current_type.take() {
+                            out.push(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {} // comments, text, PI — ignore
+            Err(e) => return Err(e.to_string()),
+        }
+        buf.clear();
+    }
+
+    Ok(out)
 }
 
-fn item_from(it: XmlItem) -> SpawnableItem {
-    SpawnableItem {
-        name: it.name.unwrap_or_default(),
-        chance: it.chance.unwrap_or(1.0),
-        preset: it.preset,
+fn element_name_lower(e: &BytesStart) -> Result<String, String> {
+    std::str::from_utf8(e.name().as_ref())
+        .map(|s| s.to_ascii_lowercase())
+        .map_err(|err| err.to_string())
+}
+
+fn element_name_lower_end(e: &BytesEnd) -> Result<String, String> {
+    std::str::from_utf8(e.name().as_ref())
+        .map(|s| s.to_ascii_lowercase())
+        .map_err(|err| err.to_string())
+}
+
+fn read_type_attrs(e: &BytesStart) -> Result<(String, bool), String> {
+    let mut name = String::new();
+    let mut hoarder = false;
+    for a in e.attributes() {
+        let a = a.map_err(|err| err.to_string())?;
+        let key = std::str::from_utf8(a.key.as_ref()).map_err(|err| err.to_string())?;
+        let val = a.unescape_value().map_err(|err| err.to_string())?;
+        match key {
+            "name" => name = val.into_owned(),
+            "hoarder" => hoarder = val.trim() == "1",
+            _ => {}
+        }
     }
+    Ok((name, hoarder))
+}
+
+fn read_group_attrs(e: &BytesStart) -> Result<(f64, Option<String>), String> {
+    let mut chance = 1.0f64;
+    let mut slot_name = None;
+    for a in e.attributes() {
+        let a = a.map_err(|err| err.to_string())?;
+        let key = std::str::from_utf8(a.key.as_ref()).map_err(|err| err.to_string())?;
+        let val = a.unescape_value().map_err(|err| err.to_string())?;
+        match key {
+            "chance" => chance = val.parse().unwrap_or(1.0),
+            "slotName" => slot_name = Some(val.into_owned()),
+            _ => {}
+        }
+    }
+    Ok((chance, slot_name))
+}
+
+fn read_item(e: &BytesStart) -> Result<SpawnableItem, String> {
+    let mut name = String::new();
+    let mut chance = 1.0f64;
+    let mut preset = None;
+    for a in e.attributes() {
+        let a = a.map_err(|err| err.to_string())?;
+        let key = std::str::from_utf8(a.key.as_ref()).map_err(|err| err.to_string())?;
+        let val = a.unescape_value().map_err(|err| err.to_string())?;
+        match key {
+            "name" => name = val.into_owned(),
+            "chance" => chance = val.parse().unwrap_or(1.0),
+            "preset" => preset = Some(val.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(SpawnableItem {
+        name,
+        chance,
+        preset,
+    })
 }
 
 fn item_to(it: &SpawnableItem) -> XmlItem {
@@ -266,5 +446,40 @@ mod tests {
             out.contains("<item name=\"ACOGOptic\""),
             "item name attr should stay inline, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn interleaved_cargo_and_attachments_parse() {
+        // This is the exact shape that blew up the old serde-based
+        // reader with "duplicate field cargo" on real-world files
+        // (Chernarus's own cfgspawnabletypes.xml, SNAFU's mod file):
+        // a single <type> with more than one <cargo> group, with an
+        // <attachments> group interleaved between them.
+        let src = r#"<?xml version="1.0" encoding="UTF-8"?>
+<spawnabletypes>
+  <type name="CrashSite_Backpack" hoarder="1">
+    <cargo chance="0.30">
+      <item name="ItemA" chance="1.00"/>
+    </cargo>
+    <attachments chance="0.50">
+      <item name="ItemB" chance="1.00"/>
+    </attachments>
+    <cargo chance="0.10">
+      <item name="ItemC" chance="1.00"/>
+    </cargo>
+  </type>
+</spawnabletypes>
+"#;
+        let types = parse_bytes(src.as_bytes(), ItemSource::Vanilla, "").unwrap();
+        assert_eq!(types.len(), 1);
+        let t = &types[0];
+        assert!(t.hoarder);
+        assert_eq!(t.cargo.len(), 2);
+        assert_eq!(t.cargo[0].chance, 0.30);
+        assert_eq!(t.cargo[0].items[0].name, "ItemA");
+        assert_eq!(t.cargo[1].chance, 0.10);
+        assert_eq!(t.cargo[1].items[0].name, "ItemC");
+        assert_eq!(t.attachments.len(), 1);
+        assert_eq!(t.attachments[0].items[0].name, "ItemB");
     }
 }
